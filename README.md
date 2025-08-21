@@ -1,2 +1,242 @@
 # Controlling-RC-CAR-using-Tilt-sensor
 implementation of a hand gesture–controlled RC car. By using a glove equipped with a tilt sensor and an ESP32 microcontroller, the system translates hand movements into commands to control the car’s motion wirelessly. The goal of this project is to explore alternative methods of interacting with robotic systems.
+
+/*********************
+ * Tilt Sensor ESP32 - Client
+ *
+ * Reads MMA8452 data, calibrates & filters, then remaps axes
+ * for proper forward/back/left/right on a glove-based sensor.
+ *
+ * Adjust "xRemap = (int)(yFilt)" and "yRemap = -(int)(xFilt)"
+ * if you need to invert or swap directions further.
+ *********************/
+
+#include <Wire.h>
+#include <WiFi.h>
+
+// ------------------------------
+// Wi-Fi Credentials
+// ------------------------------
+const char* ssid     = "Sadiq";
+const char* password = "ahmad1221";
+
+// ------------------------------
+// RC Car Server Info
+// ------------------------------
+IPAddress serverIP(192, 168, 182, 18);  // Make sure this matches your Car's actual IP
+const uint16_t serverPort = 8888;       // Port used by the Car server
+
+// MMA8452Q default I2C address
+#define MMA8452_ADDR 0x1C
+
+// ------------------------------
+// Calibration & Filter Globals
+// ------------------------------
+static int xOffset = 0, yOffset = 0, zOffset = 0; // calibration offsets
+
+// We'll use alpha = 0.5 for faster filtering (less lag).
+const float alpha = 0.5;   
+
+// We'll store our filtered values here
+static float xFilt = 0, yFilt = 0, zFilt = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  // 1. Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.println("Connecting to WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected.");
+  Serial.print("Sensor IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // 2. Initialize I2C and configure MMA8452
+  Wire.begin();
+  configureMMA8452();
+
+  // 3. Calibrate sensor (hold your arm in "neutral" position)
+  calibrateSensor();
+
+  // Initialize filtered values to offset-corrected raw
+  int xRaw, yRaw, zRaw;
+  readMMA8452(&xRaw, &yRaw, &zRaw);
+  xFilt = xRaw - xOffset;
+  yFilt = yRaw - yOffset;
+  zFilt = zRaw - zOffset;
+}
+
+void loop() {
+  // 1. Read raw data from MMA8452
+  int xRaw, yRaw, zRaw;
+  readMMA8452(&xRaw, &yRaw, &zRaw);
+
+  // Print RAW data for debugging
+  Serial.print("Raw => X:");
+  Serial.print(xRaw);
+  Serial.print(" | Y:");
+  Serial.print(yRaw);
+  Serial.print(" | Z:");
+  Serial.println(zRaw);
+
+  // 2. Update filtered values (with snap-to-zero)
+  updateFilteredValues(xRaw, yRaw, zRaw);
+
+  // Print FILTERED data for debugging
+  Serial.print("Filtered => X:");
+  Serial.print(xFilt, 2);
+  Serial.print(" | Y:");
+  Serial.print(yFilt, 2);
+  Serial.print(" | Z:");
+  Serial.println(zFilt, 2);
+
+  // --------------------------------------------------------
+  // 3. REMAP AXES FOR YOUR GLOVE ORIENTATION
+  //
+  // Goal:
+  //   Tilt Up   => yRemap > 0 => backward
+  //   Tilt Down => yRemap < 0 => forward
+  //   Thumb Out => xRemap > 0 => right
+  //   Thumb In  => xRemap < 0 => left
+  //
+  // This line means:
+  //   xRemap =  (int)(yFilt)  => "thumb out" changes yFilt => sets xRemap
+  //   yRemap = -(int)(xFilt)  => "tilt up/down" changes xFilt => sets yRemap
+  //
+  // If you find a direction reversed, swap or invert signs.
+  // --------------------------------------------------------
+  int xRemap =  (int)(yFilt);
+  int yRemap = -(int)(xFilt);
+  int zRemap =  0;  // Not used by the car
+
+  // Print REMAPPED data
+  Serial.print("Remapped => X:");
+  Serial.print(xRemap);
+  Serial.print(" | Y:");
+  Serial.print(yRemap);
+  Serial.println(" | (Z ignored)");
+
+  // 4. Send data to RC Car
+  WiFiClient client;
+  if (client.connect(serverIP, serverPort)) {
+    // Create a comma-separated string
+    String reading = String(xRemap) + "," +
+                     String(yRemap) + "," +
+                     String(zRemap) + "\n";
+    client.print(reading);
+    client.stop(); // close connection
+  } else {
+    Serial.println("Error: Could not connect to RC Car server.");
+  }
+
+  // 5. Shorter delay => ~50 updates/second
+  delay(20);
+}
+
+/********************
+ * Configure the MMA8452: set it to Standby, Active, ±2g
+ ********************/
+void configureMMA8452() {
+  // Standby
+  Wire.beginTransmission(MMA8452_ADDR);
+  Wire.write(0x2A); // CTRL_REG1
+  Wire.write(0x00); // Standby
+  Wire.endTransmission();
+
+  // Active
+  Wire.beginTransmission(MMA8452_ADDR);
+  Wire.write(0x2A);
+  Wire.write(0x01); // Active mode
+  Wire.endTransmission();
+
+  // ±2g range
+  Wire.beginTransmission(MMA8452_ADDR);
+  Wire.write(0x0E); // XYZ_DATA_CFG
+  Wire.write(0x00); // ±2g
+  Wire.endTransmission();
+}
+
+/********************
+ * Calibrate Sensor: measure offsets in neutral position
+ ********************/
+void calibrateSensor() {
+  const int samples = 50;
+  long xSum = 0, ySum = 0, zSum = 0;
+
+  for (int i = 0; i < samples; i++) {
+    int xR, yR, zR;
+    readMMA8452(&xR, &yR, &zR);
+    xSum += xR;
+    ySum += yR;
+    zSum += zR;
+    delay(30);
+  }
+
+  xOffset = xSum / samples;
+  yOffset = ySum / samples;
+  zOffset = zSum / samples;
+
+  Serial.println("Calibration completed.");
+  Serial.print("Offsets -> X: ");
+  Serial.print(xOffset);
+  Serial.print(", Y: ");
+  Serial.print(yOffset);
+  Serial.print(", Z: ");
+  Serial.println(zOffset);
+}
+
+/********************
+ * Read MMA8452 Raw Data (X, Y, Z)
+ ********************/
+void readMMA8452(int* xOut, int* yOut, int* zOut) {
+  unsigned int data[7];
+  Wire.requestFrom(MMA8452_ADDR, 7);
+  if (Wire.available() == 7) {
+    for (int i = 0; i < 7; i++) {
+      data[i] = Wire.read();
+    }
+  }
+
+  // data[0] = STATUS
+  // data[1..2] = X high, low
+  // data[3..4] = Y high, low
+  // data[5..6] = Z high, low
+
+  int xRaw = ((data[1] << 8) | data[2]) >> 4; // 12-bit
+  if (xRaw > 2047) xRaw -= 4096;
+
+  int yRaw = ((data[3] << 8) | data[4]) >> 4;
+  if (yRaw > 2047) yRaw -= 4096;
+
+  int zRaw = ((data[5] << 8) | data[6]) >> 4;
+  if (zRaw > 2047) zRaw -= 4096;
+
+  *xOut = xRaw;
+  *yOut = yRaw;
+  *zOut = zRaw;
+}
+
+/********************
+ * Subtract offsets, apply faster low-pass filter (alpha=0.5)
+ * and snap to zero to instantly stop near-neutral positions
+ ********************/
+void updateFilteredValues(int xRaw, int yRaw, int zRaw) {
+  // 1. Subtract offsets
+  xRaw -= xOffset;
+  yRaw -= yOffset;
+  zRaw -= zOffset;
+
+  // 2. Faster low-pass filter
+  xFilt = alpha * xRaw + (1.0f - alpha) * xFilt;
+  yFilt = alpha * yRaw + (1.0f - alpha) * yFilt;
+  zFilt = alpha * zRaw + (1.0f - alpha) * zFilt;
+
+  // 3. Snap to zero if under threshold -> immediate stop near neutral
+  const int stopThreshold = 50; 
+  if (abs(xFilt) < stopThreshold) xFilt = 0;
+  if (abs(yFilt) < stopThreshold) yFilt = 0;
+  if (abs(zFilt) < stopThreshold) zFilt = 0;
+}
